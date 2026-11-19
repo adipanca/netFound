@@ -39,6 +39,11 @@ uint8_t getTcpFields(const pcpp::tcphdr *tcpheader) {
     return flags;
 }
 
+// PcapPlusPlus has no SCTP entry in ProtocolType.h / IPProtocolTypes -- use the raw
+// IANA protocol number directly (see also pre_process_src/packets_processing_src/
+// 1_filter/1_filter.cpp, which needed the same workaround).
+constexpr uint8_t SCTP_PROTOCOL_NUMBER = 132;
+
 int process_file(const std::string input_file, const std::string output_file, bool tcpoptions_flag, bool no_payload_flag) {
     // Open the input pcap file
     auto *reader = pcpp::IFileReaderDevice::getReader(input_file);
@@ -320,6 +325,78 @@ int process_file(const std::string input_file, const std::string output_file, bo
 
             data = udpLayer->getLayerPayload();
             data_len = udpLayer->getLayerPayloadSize();
+        } else if (protocol == SCTP_PROTOCOL_NUMBER) {
+            // PcapPlusPlus has no SctpLayer, so we parse the raw bytes after the IP
+            // header manually (RFC 4960): a 12-byte common header followed by one or
+            // more chunks. We only extract the FIRST chunk -- enough for a per-packet
+            // signal without implementing a full chunk-walker. For a DATA chunk, the
+            // "user data" is NGAP (ASN.1 PER) -- we do NOT parse it, it's treated as
+            // opaque payload bytes exactly like PFCP/SBI payload elsewhere in this
+            // pipeline. Deliberately minimal (per SCTP_SUPPORT.md S2): fewer new
+            // fields means a smaller cold-start burden on the pretrained embeddings.
+            uint8_t *sctpData = (ipversion == 4) ? ipLayer->getLayerPayload() : ipv6Layer->getLayerPayload();
+            size_t sctpLen = (ipversion == 4) ? ipLayer->getLayerPayloadSize() : ipv6Layer->getLayerPayloadSize();
+
+            uint16_t sctp_src_port = 0, sctp_dst_port = 0;
+            uint32_t sctp_verification_tag = 0;
+            uint8_t chunk_type = 0, chunk_flags = 0;
+            uint16_t chunk_length = 0;
+            uint32_t data_tsn = 0;
+            uint16_t data_stream_id = 0, data_stream_seq = 0;
+            uint32_t data_ppid = 0;
+
+            constexpr size_t SCTP_COMMON_HEADER_LEN = 12;
+            constexpr uint8_t SCTP_DATA_CHUNK_TYPE = 0;
+            constexpr size_t SCTP_DATA_CHUNK_FIXED_LEN = 16; // 4B chunk hdr + TSN(4) + SID(2) + SSN(2) + PPID(4)
+
+            data = nullptr;
+            data_len = 0;
+
+            // ngap_malformed intentionally contains truncated/malformed SCTP packets,
+            // so every offset is bounds-checked -- missing bytes just stay 0 rather
+            // than reading past the buffer.
+            if (sctpLen >= SCTP_COMMON_HEADER_LEN) {
+                sctp_src_port = (sctpData[0] << 8) | sctpData[1];
+                sctp_dst_port = (sctpData[2] << 8) | sctpData[3];
+                sctp_verification_tag = (static_cast<uint32_t>(sctpData[4]) << 24) |
+                                         (static_cast<uint32_t>(sctpData[5]) << 16) |
+                                         (static_cast<uint32_t>(sctpData[6]) << 8) | sctpData[7];
+                // bytes [8..11] are the SCTP checksum -- not extracted (not useful post-NAT/-rewrite)
+
+                if (sctpLen >= SCTP_COMMON_HEADER_LEN + 4) {
+                    uint8_t *chunk = sctpData + SCTP_COMMON_HEADER_LEN;
+                    size_t chunkAvail = sctpLen - SCTP_COMMON_HEADER_LEN;
+                    chunk_type = chunk[0];
+                    chunk_flags = chunk[1];
+                    chunk_length = (chunk[2] << 8) | chunk[3];
+
+                    if (chunk_type == SCTP_DATA_CHUNK_TYPE && chunkAvail >= SCTP_DATA_CHUNK_FIXED_LEN) {
+                        data_tsn = (static_cast<uint32_t>(chunk[4]) << 24) | (static_cast<uint32_t>(chunk[5]) << 16) |
+                                   (static_cast<uint32_t>(chunk[6]) << 8) | chunk[7];
+                        data_stream_id = (chunk[8] << 8) | chunk[9];
+                        data_stream_seq = (chunk[10] << 8) | chunk[11];
+                        data_ppid = (static_cast<uint32_t>(chunk[12]) << 24) | (static_cast<uint32_t>(chunk[13]) << 16) |
+                                    (static_cast<uint32_t>(chunk[14]) << 8) | chunk[15];
+
+                        data = chunk + SCTP_DATA_CHUNK_FIXED_LEN;
+                        data_len = (chunkAvail > SCTP_DATA_CHUNK_FIXED_LEN) ? chunkAvail - SCTP_DATA_CHUNK_FIXED_LEN : 0;
+                    } else if (chunkAvail > 4) {
+                        data = chunk + 4;
+                        data_len = chunkAvail - 4;
+                    }
+                }
+            }
+
+            outputFileStream.write(reinterpret_cast<const char*>(&sctp_src_port), sizeof(sctp_src_port));
+            outputFileStream.write(reinterpret_cast<const char*>(&sctp_dst_port), sizeof(sctp_dst_port));
+            outputFileStream.write(reinterpret_cast<const char*>(&sctp_verification_tag), sizeof(sctp_verification_tag));
+            outputFileStream.write(reinterpret_cast<const char*>(&chunk_type), sizeof(chunk_type));
+            outputFileStream.write(reinterpret_cast<const char*>(&chunk_flags), sizeof(chunk_flags));
+            outputFileStream.write(reinterpret_cast<const char*>(&chunk_length), sizeof(chunk_length));
+            outputFileStream.write(reinterpret_cast<const char*>(&data_tsn), sizeof(data_tsn));
+            outputFileStream.write(reinterpret_cast<const char*>(&data_stream_id), sizeof(data_stream_id));
+            outputFileStream.write(reinterpret_cast<const char*>(&data_stream_seq), sizeof(data_stream_seq));
+            outputFileStream.write(reinterpret_cast<const char*>(&data_ppid), sizeof(data_ppid));
         } else if (protocol == pcpp::IPProtocolTypes::PACKETPP_IPPROTO_ICMP) {
             auto *icmpLayer = parsedPacket.getLayerOfType<pcpp::IcmpLayer>();
             if (icmpLayer == nullptr) {
@@ -348,13 +425,20 @@ int process_file(const std::string input_file, const std::string output_file, bo
             return 1;
         }
 
-        // data: get first 12 bytes of payload unless it's smaller, pad with zeros if data_len < 12
+        // data: get first N bytes of payload unless it's smaller, pad with zeros if data_len < N.
+        // SCTP gets a wider cap (40B) because its distinguishing NAS/NGAP bytes sit
+        // beyond byte 12 (see reports/fase8/nas_triplet_investigation.md); TCP/UDP/ICMP
+        // keep the original 12B cap unchanged so their tokenization is byte-identical
+        // to every prior run.
         // if no payload - fill with 0s to maintain data structure
-        size_t payload_len = no_payload_flag ? 0 : std::min(data_len, static_cast<size_t>(12));
+        constexpr size_t PAYLOAD_CAP_BYTES_DEFAULT = 12;
+        constexpr size_t PAYLOAD_CAP_BYTES_SCTP = 40;
+        const size_t PAYLOAD_CAP_BYTES = (protocol == SCTP_PROTOCOL_NUMBER) ? PAYLOAD_CAP_BYTES_SCTP : PAYLOAD_CAP_BYTES_DEFAULT;
+        size_t payload_len = no_payload_flag ? 0 : std::min(data_len, PAYLOAD_CAP_BYTES);
         for (int i = 0; i < payload_len; i++) {
             outputFileStream.write(reinterpret_cast<const char*>(&data[i]), sizeof(data[i]));
         }
-        for (size_t i = payload_len; i < 12; i++) {
+        for (size_t i = payload_len; i < PAYLOAD_CAP_BYTES; i++) {
             uint8_t zero = 0;
             outputFileStream.write(reinterpret_cast<const char*>(&zero), sizeof(zero));
         }

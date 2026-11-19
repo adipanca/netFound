@@ -5,7 +5,10 @@ from transformers.models.roformer.modeling_roformer import RoFormerEmbeddings
 from transformers.models.roberta.modeling_roberta import RobertaEmbeddings
 
 # you can increase this if you plan to support other protocols beyond 1, 6, 17
-HIGHEST_TRANSPORT_LAYER_PROTOCOL = 18
+# SCTP = 132 (see SCTP_SUPPORT.md): this embedding is indexed directly by the raw
+# IP protocol number, so the table must cover up to the highest value used + 1.
+# Rows 18-131 are allocated but never looked up (harmless, tiny memory cost).
+HIGHEST_TRANSPORT_LAYER_PROTOCOL = 133
 
 
 class netFoundEmbeddingsWithMeta:

@@ -21,12 +21,14 @@ class Protocol(Enum):
     TCP = 6
     UDP = 17
     ICMP = 1
+    SCTP = 132
 
 
 PROTOCOL_FIELDS = {
     Protocol.TCP: "TCPFields",
     Protocol.UDP: "UDPFields",
     Protocol.ICMP: "ICMPFields",
+    Protocol.SCTP: "SCTPFields",
 }
 
 FLOW_SIZE_LIMIT = 12
@@ -37,6 +39,14 @@ BURST_SPLIT_BORDER = 10000000
 INTERNAL_IPS = ["127.0.0.1/8"]
 TOKEN_BYTES_LENGTH = 2
 TCP_OPTIONS = False
+# Must match the per-protocol PAYLOAD_CAP_BYTES_* constants in
+# 3_field_extraction.cpp (the C++ side writes exactly this many payload bytes
+# per packet, zero-padded if shorter). SCTP gets a wider window because its
+# distinguishing NAS/NGAP bytes sit beyond byte 12 (see
+# reports/fase8/nas_triplet_investigation.md); TCP/UDP/ICMP keep the original
+# 12-byte cap so their tokenization is unchanged from every prior run.
+PAYLOAD_CAP_BYTES_DEFAULT = 12
+PAYLOAD_CAP_BYTES_SCTP = 40
 
 ## Reserved label names
 FILENAME_SUBSTITUTION = "RESERVED_FILENAME"
@@ -64,7 +74,8 @@ def tokenize_file(inpt_file, label) -> Optional[list]:
             )
             return
 
-        payloadTokenNum = config["Payload"][0]["numberTokens"]
+        payload_field_name = "PayloadSCTP" if protocol == Protocol.SCTP else "Payload"
+        payloadTokenNum = config[payload_field_name][0]["numberTokens"]
         tokensPerPacket = sum([field["numberTokens"] for field in config["IPFields"]])
         tokensPerPacket += (
                 sum([field["numberTokens"] for field in config[field_name]])
@@ -106,12 +117,12 @@ def tokenize_file(inpt_file, label) -> Optional[list]:
 
         tokenize_fields_df(config, "IPFields", bursts)
         tokenize_fields_df(config, field_name, bursts)
-        tokenize_fields_df(config, "Payload", bursts)
+        tokenize_fields_df(config, payload_field_name, bursts)
 
         columns = (
                 [x["field"] for x in config["IPFields"]]
                 + [x["field"] for x in config[field_name]]
-                + [x["field"] for x in config["Payload"]]
+                + [x["field"] for x in config[payload_field_name]]
         )
 
         bursts.loc[:, "concatenated"] = bursts[columns].sum(axis=1)
@@ -185,7 +196,23 @@ def get_bursts_from_flow_file(inpt_file):
                             get_int_from_byte(f.read(1)),
                         ]
                     )
-                currFlowRow.append(get_int_from_byte(f.read(12), byte_order="big"))
+                if protocol == Protocol.SCTP:
+                    f.read(2)  # srcport
+                    f.read(2)  # dstport
+                    currFlowRow.extend(
+                        [
+                            get_int_from_byte(f.read(4)),  # verification tag
+                            get_int_from_byte(f.read(1)),  # chunk type
+                            get_int_from_byte(f.read(1)),  # chunk flags
+                            get_int_from_byte(f.read(2)),  # chunk length
+                            get_int_from_byte(f.read(4)),  # DATA chunk: TSN (0 if not a DATA chunk)
+                            get_int_from_byte(f.read(2)),  # DATA chunk: stream identifier
+                            get_int_from_byte(f.read(2)),  # DATA chunk: stream sequence number
+                            get_int_from_byte(f.read(4)),  # DATA chunk: payload protocol id (PPID)
+                        ]
+                    )
+                payload_cap_bytes = PAYLOAD_CAP_BYTES_SCTP if protocol == Protocol.SCTP else PAYLOAD_CAP_BYTES_DEFAULT
+                currFlowRow.append(get_int_from_byte(f.read(payload_cap_bytes), byte_order="big"))
                 flow_rows.append(currFlowRow)
         except ValueError:
             print(f"Unexpected end of file occured for {inpt_file}")
@@ -219,6 +246,18 @@ def get_bursts_from_flow_file(inpt_file):
     elif protocol == Protocol.UDP:
         columns += [
             "UDP_len",
+            "Payload",
+        ]
+    elif protocol == Protocol.SCTP:
+        columns += [
+            "SCTP_vtag",
+            "SCTP_chunk_type",
+            "SCTP_chunk_flags",
+            "SCTP_chunk_length",
+            "SCTP_tsn",
+            "SCTP_stream_id",
+            "SCTP_stream_seq",
+            "SCTP_ppid",
             "Payload",
         ]
     else:

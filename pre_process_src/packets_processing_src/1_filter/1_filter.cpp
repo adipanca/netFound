@@ -67,18 +67,33 @@ int main(int argc, char *argv[]) {
         pcpp::Packet parsedPacket(&rawPacket);
         int ipversion = 0;
         auto *ipLayer = parsedPacket.getLayerOfType<pcpp::IPv4Layer>();
+        pcpp::IPv6Layer *ipv6Layer = nullptr;
         if (ipLayer != nullptr) {
             ipversion = 4;
         } else {
-            auto *ipv6Layer = parsedPacket.getLayerOfType<pcpp::IPv6Layer>();
+            ipv6Layer = parsedPacket.getLayerOfType<pcpp::IPv6Layer>();
             if (ipv6Layer != nullptr) {
                 ipversion = 6;
             }
         }
+
+        // PcapPlusPlus has no dedicated SCTP layer type (see ProtocolType.h), so
+        // isPacketOfType() can't detect it. SCTP (IP protocol number 132) carries
+        // NGAP/NAS 5G signaling -- check the raw IP protocol/next-header field
+        // directly instead of relying on a parsed layer type.
+        const uint8_t SCTP_PROTOCOL_NUMBER = 132;
+        bool isSctp = false;
+        if (ipversion == 4 && ipLayer->getIPv4Header()->protocol == SCTP_PROTOCOL_NUMBER) {
+            isSctp = true;
+        } else if (ipversion == 6 && ipv6Layer->getIPv6Header()->nextHeader == SCTP_PROTOCOL_NUMBER) {
+            isSctp = true;
+        }
+
         if (ipversion != 0) {
             if (parsedPacket.isPacketOfType(pcpp::TCP) ||
                 parsedPacket.isPacketOfType(pcpp::UDP) ||
-                parsedPacket.isPacketOfType(pcpp::ICMP)) {
+                parsedPacket.isPacketOfType(pcpp::ICMP) ||
+                isSctp) {
                 writer->writePacket(rawPacket);
             }
         }

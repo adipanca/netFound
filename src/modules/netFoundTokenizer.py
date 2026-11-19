@@ -13,7 +13,8 @@ FlowType = List[BurstType]
 PROTOCOLS_LENGTH_WITHOUT_PAYLOAD = {
     6: 12,  # TCP
     1: 7,   # ICMP
-    17: 6  # UDP
+    17: 6,  # UDP
+    132: 16,  # SCTP: IPFields(5) + SCTPFields(vtag2+type1+flags1+len1+tsn2+sid1+ssn1+ppid2=11)
 }
 PAYLOAD_LENGTH = 6
 
@@ -114,15 +115,26 @@ class netFoundTokenizer(PreTrainedTokenizer):
             for flow in flows
         ]
 
+    # Protocols listed here keep their payload even when strip_payload=True, with
+    # their own (header_length, payload_length) layout -- used by the pc40
+    # experiment (reports/fase8/nas_triplet_investigation.md) so SCTP gets its
+    # wider 40-byte/20-token payload while TCP/UDP/ICMP stay byte-identical to
+    # every prior run (unconditionally stripped, same as the pretrained checkpoint).
+    PAYLOAD_EXEMPT_PROTOCOLS = {132: (16, 20)}  # SCTP: header=16 tok, payload=20 tok
+
     @staticmethod
     def _strip_payload(burst_tokens: List[FlowType], protocols: List[int]) -> List[FlowType]:
         """
         `burst_tokens` is List[flow][burst][token].
         Dataset tokens include payload; for payload-disabled runs we keep only header tokens.
+        Protocols in PAYLOAD_EXEMPT_PROTOCOLS are passed through unstripped.
         """
         stripped_burst_tokens = []
         for flow_idx, flow in enumerate(burst_tokens):
             proto = protocols[flow_idx]
+            if proto in netFoundTokenizer.PAYLOAD_EXEMPT_PROTOCOLS:
+                stripped_burst_tokens.append(flow)
+                continue
             header_length = PROTOCOLS_LENGTH_WITHOUT_PAYLOAD.get(proto)
             if header_length is None:
                 raise ValueError(f"Unsupported protocol {proto} for payload stripping.")
@@ -176,7 +188,18 @@ class netFoundTokenizer(PreTrainedTokenizer):
 
         if self.strip_payload:
             dataset['burst_tokens'] = self._strip_payload(dataset['burst_tokens'], dataset['protocol'])
-        dataset_burst_sizes = [[len(burst) for burst in flow] for flow in dataset["burst_tokens"]]
+        # Clamp to max_burst_length - 1 (the budget left after the CLS token) so this
+        # matches exactly what truncate_flow() will produce for "input_ids" below.
+        # For TCP/UDP/ICMP this is a no-op (their per-packet token footprint was
+        # already tuned to fit within max_burst_length), but a heavier protocol's
+        # fully-packed burst (e.g. SCTP: 6 packets x 16 header tokens = 96 > 73)
+        # would otherwise report an untruncated size here, causing the collator to
+        # pad/generate burst positions past the model's fixed position-embedding
+        # size -- a protocol-agnostic fix, not an SCTP-specific one.
+        dataset_burst_sizes = [
+            [min(len(burst), self.max_burst_length - 1) for burst in flow]
+            for flow in dataset["burst_tokens"]
+        ]
 
         if not self.pretraining and "labels" in dataset:
             labels = np.array(dataset["labels"], dtype=int)
